@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Lety">
+<title>Sledování letů</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  html, body { height: 100%; margin: 0; font-family: -apple-system, system-ui, sans-serif; }
+  #map { position: absolute; inset: 0; }
+  #top { position: absolute; z-index: 1000; top: env(safe-area-inset-top, 0); left: 0; right: 0;
+         padding: 10px; display: flex; gap: 8px; }
+  #search { flex: 1; font-size: 16px; padding: 10px 14px; border: 0; border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,.25); }
+  #refresh { font-size: 20px; border: 0; border-radius: 12px; padding: 0 14px; background: #fff;
+             box-shadow: 0 2px 8px rgba(0,0,0,.25); }
+  #status { position: absolute; z-index: 1000; top: calc(env(safe-area-inset-top, 0) + 62px); left: 50%;
+            transform: translateX(-50%); font-size: 13px; padding: 4px 12px; border-radius: 99px;
+            background: rgba(255,255,255,.9); display: none; }
+  #status.err { background: #d33; color: #fff; }
+  #card { position: absolute; z-index: 1000; left: 10px; right: 10px;
+          bottom: calc(env(safe-area-inset-bottom, 0) + 10px); background: #fff; border-radius: 16px;
+          padding: 14px 16px; box-shadow: 0 2px 12px rgba(0,0,0,.3); display: none; }
+  #card h2 { margin: 0 0 2px; font-size: 22px; }
+  #card .sub { color: #666; margin-bottom: 10px; }
+  #card .stats { display: flex; justify-content: space-between; }
+  #card .stats small { display: block; color: #888; font-size: 12px; }
+  #card .stats b { font-size: 17px; }
+  .plane { width: 28px; height: 28px; }
+  .plane svg { width: 28px; height: 28px; fill: #1a73e8; stroke: #fff; stroke-width: 1; }
+  .plane.ground svg { fill: #888; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="top">
+  <input id="search" type="search" placeholder="Číslo letu (např. OK123)">
+  <button id="refresh" aria-label="Obnovit">⟳</button>
+</div>
+<div id="status"></div>
+<div id="card"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const map = L.map('map', { zoomControl: false }).setView([49.8, 15.5], 7);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 18, attribution: '© OpenStreetMap, data: OpenSky Network'
+}).addTo(map);
+
+const PLANE = '<svg viewBox="0 0 24 24"><path d="M12 2l2 7 8 5v2l-8-2 -1 5 3 2v1l-4-1 -4 1v-1l3-2 -1-5 -8 2v-2l8-5z"/></svg>';
+const markers = new Map();
+let flights = [], selectedId = null;
+const $ = id => document.getElementById(id);
+
+function status(msg, err) {
+  const s = $('status');
+  if (!msg) { s.style.display = 'none'; return; }
+  s.textContent = msg; s.className = err ? 'err' : ''; s.style.display = 'block';
+}
+
+async function load() {
+  const b = map.getBounds();
+  // omezení velikosti oblasti
+  const c = b.getCenter();
+  const dLat = Math.min((b.getNorth() - b.getSouth()) / 2, 3);
+  const dLon = Math.min((b.getEast() - b.getWest()) / 2, 5);
+  const url = 'https://opensky-network.org/api/states/all?' + new URLSearchParams({
+    lamin: c.lat - dLat, lamax: c.lat + dLat, lomin: c.lng - dLon, lomax: c.lng + dLon
+  });
+  status('Načítám…');
+  try {
+    const r = await fetch(url);
+    if (r.status === 429) { status('Příliš mnoho požadavků, zkuste to za chvíli.', true); return; }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    flights = (j.states || []).filter(s => s[5] != null && s[6] != null).map(s => ({
+      id: s[0], callsign: (s[1] || '').trim() || s[0].toUpperCase(), country: s[2] || '—',
+      lon: s[5], lat: s[6], alt: s[7], onGround: !!s[8], speed: s[9], heading: s[10] || 0
+    }));
+    status('');
+    render();
+  } catch (e) {
+    status('Nepodařilo se načíst data.', true);
+  }
+}
+
+function render() {
+  const q = $('search').value.trim().toLowerCase();
+  const visible = flights.filter(f => !q || f.callsign.toLowerCase().includes(q));
+  const keep = new Set(visible.map(f => f.id));
+  for (const [id, m] of markers) if (!keep.has(id)) { map.removeLayer(m); markers.delete(id); }
+  for (const f of visible) {
+    const icon = L.divIcon({
+      className: '', iconSize: [28, 28], iconAnchor: [14, 14],
+      html: `<div class="plane ${f.onGround ? 'ground' : ''}" style="transform:rotate(${f.heading}deg)">${PLANE}</div>`
+    });
+    let m = markers.get(f.id);
+    if (m) { m.setLatLng([f.lat, f.lon]); m.setIcon(icon); }
+    else {
+      m = L.marker([f.lat, f.lon], { icon }).addTo(map);
+      m.on('click', () => { selectedId = f.id; showCard(); });
+      markers.set(f.id, m);
+    }
+  }
+  showCard();
+}
+
+function showCard() {
+  const f = flights.find(x => x.id === selectedId);
+  const card = $('card');
+  if (!f) { card.style.display = 'none'; return; }
+  card.innerHTML = `<h2>${f.callsign}</h2>
+    <div class="sub">${f.country} · ${f.onGround ? 'Na zemi' : 'Ve vzduchu'}</div>
+    <div class="stats">
+      <div><small>Výška</small><b>${f.alt != null ? Math.round(f.alt * 3.28084) + ' ft' : '—'}</b></div>
+      <div><small>Rychlost</small><b>${f.speed != null ? Math.round(f.speed * 3.6) + ' km/h' : '—'}</b></div>
+      <div><small>Kurz</small><b>${Math.round(f.heading)}°</b></div>
+    </div>`;
+  card.style.display = 'block';
+}
+
+map.on('click', () => { selectedId = null; showCard(); });
+let t; map.on('moveend', () => { clearTimeout(t); t = setTimeout(load, 600); });
+$('search').addEventListener('input', render);
+$('refresh').addEventListener('click', load);
+setInterval(load, 20000);
+load();
+</script>
+</body>
+</html>
