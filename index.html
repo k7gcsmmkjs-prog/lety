@@ -60,30 +60,58 @@ function status(msg, err) {
   s.textContent = msg; s.className = err ? 'err' : ''; s.style.display = 'block';
 }
 
+function fromAdsb(j) {
+  return (j.ac || []).filter(a => a.lat != null && a.lon != null && a.hex).map(a => ({
+    id: a.hex,
+    callsign: (a.flight || '').trim() || a.r || a.hex.toUpperCase(),
+    country: [a.r, a.t].filter(Boolean).join(' · ') || '—',
+    lat: a.lat, lon: a.lon,
+    alt: a.alt_baro === 'ground' ? 0 : (typeof a.alt_baro === 'number' ? a.alt_baro / 3.28084 : null),
+    onGround: a.alt_baro === 'ground',
+    speed: a.gs != null ? a.gs * 0.514444 : null,
+    heading: a.track || 0
+  }));
+}
+
+function fromOpenSky(j) {
+  return (j.states || []).filter(s => s[5] != null && s[6] != null).map(s => ({
+    id: s[0], callsign: (s[1] || '').trim() || s[0].toUpperCase(), country: s[2] || '—',
+    lon: s[5], lat: s[6], alt: s[7], onGround: !!s[8], speed: s[9], heading: s[10] || 0
+  }));
+}
+
+async function getJson(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
 async function load() {
   const b = map.getBounds();
-  // omezení velikosti oblasti
   const c = b.getCenter();
+  const nm = Math.min(250, Math.max(10, Math.round(c.distanceTo(b.getNorthEast()) / 1852)));
+  const lat = c.lat.toFixed(3), lon = c.lng.toFixed(3);
   const dLat = Math.min((b.getNorth() - b.getSouth()) / 2, 3);
   const dLon = Math.min((b.getEast() - b.getWest()) / 2, 5);
-  const url = 'https://opensky-network.org/api/states/all?' + new URLSearchParams({
-    lamin: c.lat - dLat, lamax: c.lat + dLat, lomin: c.lng - dLon, lomax: c.lng + dLon
-  });
+
+  const sources = [
+    async () => fromAdsb(await getJson(`https://api.adsb.lol/v2/point/${lat}/${lon}/${nm}`)),
+    async () => fromAdsb(await getJson(`https://api.airplanes.live/v2/point/${lat}/${lon}/${nm}`)),
+    async () => fromOpenSky(await getJson('https://opensky-network.org/api/states/all?' + new URLSearchParams({
+      lamin: c.lat - dLat, lamax: c.lat + dLat, lomin: c.lng - dLon, lomax: c.lng + dLon
+    })))
+  ];
+
   status('Načítám…');
-  try {
-    const r = await fetch(url);
-    if (r.status === 429) { status('Příliš mnoho požadavků, zkuste to za chvíli.', true); return; }
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const j = await r.json();
-    flights = (j.states || []).filter(s => s[5] != null && s[6] != null).map(s => ({
-      id: s[0], callsign: (s[1] || '').trim() || s[0].toUpperCase(), country: s[2] || '—',
-      lon: s[5], lat: s[6], alt: s[7], onGround: !!s[8], speed: s[9], heading: s[10] || 0
-    }));
-    status('');
-    render();
-  } catch (e) {
-    status('Nepodařilo se načíst data.', true);
+  for (const src of sources) {
+    try {
+      flights = await src();
+      status('');
+      render();
+      return;
+    } catch (e) { /* zkusíme další zdroj */ }
   }
+  status('Nepodařilo se načíst data.', true);
 }
 
 function render() {
